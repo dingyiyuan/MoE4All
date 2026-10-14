@@ -1823,14 +1823,18 @@ pub(crate) fn kv_row_align_ok(cfg: &Config) -> bool {
 /// what keeps the estimate and the allocation in agreement: a format the runner will refuse to
 /// build can never be pinned and priced in the first place.
 pub(crate) fn kv_q8_layout_ok(cfg: &Config) -> bool {
-    !cfg.deepseek2 && !cfg.deepseek4 && !cfg.bailingmoe3 && kv_row_align_ok(cfg)
+    !cfg.deepseek2
+        && !cfg.deepseek4
+        && !cfg.bailingmoe3
+        && !cfg.glm5next
+        && kv_row_align_ok(cfg)
 }
 
 /// Resolve the KV dtype the Vulkan runner will allocate for one side, for placement accounting.
 /// This mirrors `runner.rs`'s capability gates closely enough that an explicit Q8/F16 choice is
 /// priced exactly instead of the MoE planner treating every non-auto choice as f16.
 fn vulkan_kv_fmt_for_budget(cfg: &Config, ec: &EngineConfig, requested: Option<DType>) -> DType {
-    if cfg.deepseek2 || cfg.deepseek4 || cfg.bailingmoe3 {
+    if cfg.deepseek2 || cfg.deepseek4 || cfg.bailingmoe3 || cfg.glm5next {
         return DType::F16;
     }
     let block_aligned = kv_row_align_ok(cfg);

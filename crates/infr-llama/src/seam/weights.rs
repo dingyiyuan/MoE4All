@@ -1136,7 +1136,7 @@ impl SeamKv {
     /// recurrent models can only export their live frontier or a captured turn checkpoint; an
     /// arbitrary token LCP has no matching recurrent/PLE summary.
     pub(crate) fn seedable_prefix_len(&self, cfg: &Config, prompt: &[u32]) -> usize {
-        if cfg.qwen35 || cfg.bailingmoe3 || cfg.deepseek4 {
+        if cfg.qwen35 || cfg.bailingmoe3 || cfg.glm5next || cfg.deepseek4 {
             return 0;
         }
         if !cfg.qwen4exp {
@@ -1243,7 +1243,7 @@ impl SeamKv {
             &self.qsa_kbufs,
             &self.qsa_cbufs,
         )?;
-        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 {
+        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 || cfg.glm5next {
             let conv_elems = (cfg.ssm_d_conv - 1) * cfg.recurrent_conv_channels();
             let s_elems = cfg.recurrent_state_elems();
             let conv_zero = vec![0f32; conv_elems];
@@ -1643,7 +1643,7 @@ impl SeamKv {
             None
         };
         let mut turn_recurrent_ckpts = std::array::from_fn(|_| None);
-        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 {
+        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 || cfg.glm5next {
             for checkpoint in &mut turn_recurrent_ckpts {
                 TurnRecurrentCkpt::begin(
                     checkpoint,
@@ -1767,7 +1767,7 @@ impl SeamKv {
         src: &SeamKv,
         p: usize,
     ) -> AResult<usize> {
-        if cfg.qwen35 || cfg.bailingmoe3 || cfg.deepseek4 {
+        if cfg.qwen35 || cfg.bailingmoe3 || cfg.glm5next || cfg.deepseek4 {
             return Ok(0);
         }
         if cfg.qwen4exp {

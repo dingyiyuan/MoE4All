@@ -549,7 +549,7 @@ fn prepare_parallel_prompt_state(
     turn_checkpoint: Option<TurnCheckpoint>,
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<PreparedParallelPrompt> {
-    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3;
+    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3 || c.glm5next;
     let live_turn_start = recurrent_model
         .then(|| recurrent_extension_start(&kv.cached, prompt))
         .flatten();
@@ -1029,10 +1029,10 @@ fn session_stable(
     let fuse_qsa_prepare = fuse_qsa_prepare_decision(caps.qsa_prepare, g, c, ec);
     let fuse_delta_ab = fuse_delta_ab_decision(caps.linear_pair_f32, g, c, ec);
     let fuse_qwen_hc_down_inject = caps.qwen_hc_down_inject && ec.kernels.qwen_hc_down_inject;
-    let kda_qkv_fused = if c.bailingmoe3 {
+    let kda_qkv_fused = if c.bailingmoe3 || c.glm5next {
         (0..c.n_layer)
             .map(|l| {
-                if c.is_bailing_mla_layer(l) {
+                if c.is_mla_layer(l) {
                     Ok(false)
                 } else {
                     kda_qkv_is_fused(g, l)
@@ -1958,12 +1958,12 @@ fn generate_dense_backend_inner(
     let max_qrow = nh * max_hd;
     // DeepSeek2 MLA: per-layer dims are uniform (no SWA/full variation), but the max calc is for
     // uniform models anyway.
-    let mla_key_len = if c.deepseek2 || c.bailingmoe3 {
+    let mla_key_len = if c.deepseek2 || c.bailingmoe3 || c.glm5next {
         c.kv_lora_rank + c.qk_rope_dim
     } else {
         0
     };
-    let mla_qhead = if c.deepseek2 || c.bailingmoe3 {
+    let mla_qhead = if c.deepseek2 || c.bailingmoe3 || c.glm5next {
         c.head_k_mla + c.qk_rope_dim
     } else {
         0
@@ -2281,7 +2281,7 @@ fn generate_dense_backend_inner(
                     }
                     let bytes = expanded.iter().flat_map(|&x| x.to_le_bytes()).collect();
                     (WBytes::Owned(bytes), DType::F32, expanded.len())
-                } else if ((c.deepseek2 || c.bailingmoe3)
+                } else if ((c.deepseek2 || c.bailingmoe3 || c.glm5next)
                     && (name.ends_with("attn_k_b.weight") || name.ends_with("attn_v_b.weight")))
                     || (c.deepseek4
                         && (name.contains("_compressor_ape.weight")
@@ -2355,7 +2355,7 @@ fn generate_dense_backend_inner(
             // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
             let is_delta = (c.qwen35 || c.qwen4exp) && !c.is_qwen_hybrid_attn_layer(l);
             let is_mla = c.is_mla_layer(l);
-            let is_kda = c.bailingmoe3 && !is_mla;
+            let is_kda = (c.bailingmoe3 || c.glm5next) && !is_mla;
             // DeepSeek V4: neither MLA nor plain attention — single-head MQA KV, a low-rank grouped
             // output projection, attention sinks, hyper-connections and up to two compressor blocks
             // per layer. `false` for every other arch. See docs/deepseek.md § Stage 4.
@@ -2375,6 +2375,21 @@ fn generate_dense_backend_inner(
                 }
             } else {
                 wload(&[&p("attn_norm.weight")])?;
+            }
+            if c.glm5next {
+                // glm5next.cpp reads the SAME (fn, base, scale) hyper-connection triples as
+                // deepseek4 on every trunk block (the NextN block carries none — the trunk loop
+                // stops before it) — but keeps the plain `attn_norm` above: no HC input norm.
+                for name in [
+                    "hc_attn_fn.weight",
+                    "hc_attn_base.weight",
+                    "hc_attn_scale.weight",
+                    "hc_ffn_fn.weight",
+                    "hc_ffn_base.weight",
+                    "hc_ffn_scale.weight",
+                ] {
+                    wload(&[&p(name)])?;
+                }
             }
             if is_mla {
                 // MLA: wq_a → q_a_norm → wq_b (or wq for lite), wkv_a_mqa, kv_a_norm, wk_b, wv_b, wo.
@@ -2406,6 +2421,21 @@ fn generate_dense_backend_inner(
                     wload(&[&p("indexer.proj.weight")])?;
                     wload(&[&p("indexer.attn_k.weight")])?;
                     wload(&[&p("indexer.attn_q_b.weight")])?;
+                }
+                if c.glm5next {
+                    // glm5next.cpp reads the five V3.2 lightning-indexer tensors on its MLA
+                    // blocks, PLUS a two-tensor key-pooling compressor: `indexer_compressor_ape`
+                    // `[kpool, key_length]` (the learned per-slot APE) and `indexer_compressor_gate`
+                    // `[n_embd, key_length]` — the kpool-4 pool whose semantics llama.cpp keeps
+                    // in-graph (score 4 consecutive tokens, keep incomplete tail pools). KDA blocks
+                    // carry neither.
+                    wload(&[&p("indexer.k_norm.weight")])?;
+                    wload(&[&p("indexer.k_norm.bias")])?;
+                    wload(&[&p("indexer.proj.weight")])?;
+                    wload(&[&p("indexer.attn_k.weight")])?;
+                    wload(&[&p("indexer.attn_q_b.weight")])?;
+                    wload(&[&p("indexer_compressor_ape.weight")])?;
+                    wload(&[&p("indexer_compressor_gate.weight")])?;
                 }
             } else if is_dsv4 {
                 // `deepseek4.cpp::load_arch_tensors`, in its order. The Q path is deepseek2's LoRA
@@ -2483,12 +2513,21 @@ fn generate_dense_backend_inner(
                 ])?;
                 let forget = kda_projection_name(g, l, "ssm_f.weight", "ssm_f_a.weight")?;
                 wload(&[&forget])?;
+                if c.glm5next {
+                    // GLM's forget gate is TWO-stage low-rank: `ssm_f_a` then `ssm_f_b` (Ling
+                    // carries only the single `ssm_f_a`). Loaded here; the graph consumes it in
+                    // M2 — until then placed but unread.
+                    wload(&[&p("ssm_f_b.weight")])?;
+                }
                 wload(&[&p("ssm_beta.weight")])?;
                 wload(&[&p("ssm_a")])?;
                 wload(&[&p("ssm_dt.bias")])?;
                 wload(&[&p("ssm_norm.weight")])?;
                 let gate = kda_projection_name(g, l, "ssm_g.weight", "ssm_g_a.weight")?;
                 wload(&[&gate])?;
+                if c.glm5next {
+                    wload(&[&p("ssm_g_b.weight")])?;
+                }
                 wload(&[&p("attn_output.weight")])?;
             } else if is_delta {
                 wload(&[&p("attn_qkv.weight")])?;
@@ -2614,7 +2653,7 @@ fn generate_dense_backend_inner(
                     wload(&[&p("ffn_up_exps.weight")])?;
                 }
                 wload(&[&p("ffn_down_exps.weight")])?;
-                if c.deepseek2 || c.bailingmoe3 {
+                if c.deepseek2 || c.bailingmoe3 || c.glm5next {
                     let ep_name = p("exp_probs_b.bias");
                     if g.tensors().iter().any(|t| t.name == ep_name) {
                         wload(&[&ep_name])?;
@@ -3243,7 +3282,7 @@ fn generate_dense_backend_inner(
     // A live append-only recurrent state wins when the new prompt extends it exactly. Otherwise
     // try the last stable conversation checkpoint before taking the unchanged zero-reset path.
     // Restoration is device-side work, so concurrent serve takes the same GPU baton as a forward.
-    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3;
+    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3 || c.glm5next;
     let cached_before_restore = state.as_ref().map_or(0, |kv| kv.cached.len());
     let common_before_restore = state_trace.then(|| {
         state
@@ -4063,7 +4102,7 @@ fn generate_dense_backend_inner(
             // the `wload` skip above). `is_delta` is `false` for every non-qwen35 model.
             let is_delta = (c.qwen35 || c.qwen4exp) && !c.is_qwen_hybrid_attn_layer(l);
             let is_mla = c.is_mla_layer(l);
-            let is_kda = c.bailingmoe3 && !is_mla;
+            let is_kda = (c.bailingmoe3 || c.glm5next) && !is_mla;
             let mixer = if c.deepseek4 {
                 // EXACT order of `wload`'s `is_dsv4` arm — `wpush` consumes `wspecs` sequentially,
                 // so one handle out of place binds every later weight in the model one buffer off,
@@ -4603,12 +4642,12 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
-        let mla_kv_cmpr = if c.deepseek2 || c.bailingmoe3 {
+        let mla_kv_cmpr = if c.deepseek2 || c.bailingmoe3 || c.glm5next {
             Some(g.internal(f32d(batch * c.kv_lora_rank)))
         } else {
             None
         };
-        let mla_rope = if c.deepseek2 || c.bailingmoe3 {
+        let mla_rope = if c.deepseek2 || c.bailingmoe3 || c.glm5next {
             Some(g.internal(f32d(batch * c.qk_rope_dim)))
         } else {
             None
@@ -11219,6 +11258,9 @@ fn generate_dense_backend_inner(
         // cache). Keeps the "strict subset" promise the gate's doc states.
         && !c.deepseek2
         && !c.bailingmoe3
+        // glm5next: same trap — `Op::Mla` on its MLA blocks and (from M2) `Op::HyperConnectMix`
+        // on every block, none with a record-once dyn twin.
+        && !c.glm5next
         // DeepSeek V4: the same trap, from four ops at once. `Op::Attention { sinks }`,
         // `Op::HyperConnectMix`/`Pre`/`Post`, `Op::Rope { backward }` and `Op::QkNorm { weight:
         // None }` each have no record-once dyn twin, so the adapter's `decode_eligible` is false —
