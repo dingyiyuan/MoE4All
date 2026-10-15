@@ -4780,17 +4780,32 @@ fn generate_dense_backend_inner(
         //   ix_mask [batch, kv_len]                              additive score mask for Op::Mla
         // `ix_topk`/`ix_mask` are sized by the SELECTION, so they scale with the context, not with
         // the model: `batch * kv_len` f32 is the mask's whole cost (see `Op::TopkMask`).
-        let ix_top_k = c.indexer_top_k.min(start_pos + batch);
-        let (ix_q, ix_k, ix_w, ix_topk, ix_mask) = if c.deepseek32 {
+        // glm5next's token budget must stay a multiple of kpool (pools emit 4 slots each); the
+        // ceiling is the causal prefix rounded UP to a whole pool so every real token fits.
+        let ix_top_k = if c.glm5next && be.name() == "cpu" {
+            let ceil = ((start_pos + batch + c.indexer_kpool - 1) / c.indexer_kpool)
+                * c.indexer_kpool;
+            c.indexer_top_k.min(ceil)
+        } else {
+            c.indexer_top_k.min(start_pos + batch)
+        };
+        // glm5next's kpool indexer runs on the CPU backend (the Vulkan shader is pending); the
+        // token budget is the GGUF's `top_k` (pools kept = top_k / kpool), and the packed
+        // `[key | gate]` scratch is one row the WriteKv lands in the V-side cache.
+        let glm_ix = c.glm5next && be.name() == "cpu";
+        let (ix_q, ix_k, ix_w, ix_topk, ix_mask, ix_gate, ix_kg) = if c.deepseek32 || glm_ix {
             (
                 Some(g.internal(f32d(batch * c.indexer_n_head * c.indexer_head_size))),
                 Some(g.internal(f32d(batch * c.indexer_head_size))),
                 Some(g.internal(f32d(batch * c.indexer_n_head))),
                 Some(g.internal(TensorDesc::new(vec![batch * ix_top_k], DType::I32))),
                 Some(g.internal(f32d(batch * (start_pos + batch)))),
+                // dsv32-only slots stay None; glm5next-only slots mirror that.
+                glm_ix.then(|| g.internal(f32d(batch * c.indexer_head_size))),
+                glm_ix.then(|| g.internal(f32d(batch * 2 * c.indexer_head_size))),
             )
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None, None, None, None)
         };
         // Fused-QKV prefill staging: the wide GEMM writes [batch, qrow+2·kvrow] here, then three
         // CopyStrided ops split it into q/k/v. Decode (batch==1) skips it (offset GEMVs).
@@ -6336,13 +6351,128 @@ fn generate_dense_backend_inner(
                 // The emit reads `mw.indexer`, NOT `c.deepseek32`: a V3.2 model whose indexer
                 // weights were not captured therefore takes the `else` below and FAILS loudly,
                 // instead of quietly running the deepseek2 graph over every key.
-                // glm5next INTENTIONALLY falls through to the dense deepseek2 mask for now: its
-                // indexer is a kpool-4 POOL scorer (`glm5-next.cpp::build_kpool_select` — pooled
-                // keys + APE softmax + gate, no rope on the indexer heads), which shares nothing
-                // with V3.2's per-token rope'd lightning indexer emitted below. The pool graph is
-                // M2 wiring; dense attention over every key keeps the trunk numerically honest in
-                // shape while it lands.
-                let key_mask = match mw.indexer.as_ref().filter(|_| !c.glm5next) {
+                // glm5next runs its kpool-4 POOL indexer (`glm5-next.cpp`) on the CPU backend via
+                // the `glm_ix` arm below — pooled keys + per-channel APE softmax + gate, NO rope
+                // on the indexer heads. On backends whose shader has not landed (Vulkan) it keeps
+                // the dense deepseek2 mask: at ≤ top_k keys the selection IS the causal prefix, so
+                // the interim is numerically equal there and only diverges past the pool budget.
+                let key_mask = if glm_ix && mw.indexer.is_some() {
+                    let ix = mw.indexer.as_ref().expect("glm_ix implies indexer weights");
+                    let ix_q = ix_q.expect("glm5next without ix_q scratch");
+                    let ix_k = ix_k.expect("glm5next without ix_k scratch");
+                    let ix_w = ix_w.expect("glm5next without ix_w scratch");
+                    let ix_topk = ix_topk.expect("glm5next without ix_topk scratch");
+                    let ix_mask = ix_mask.expect("glm5next without ix_mask scratch");
+                    let ix_gate = ix_gate.expect("glm5next without ix_gate scratch");
+                    let ix_kg = ix_kg.expect("glm5next without ix_kg scratch");
+                    let ix_nh = c.indexer_n_head as u32;
+                    let ix_hd = c.indexer_head_size as u32;
+                    let kv_len = (start_pos + batch) as u32;
+                    // indexer_k = LayerNorm(indexer_attn_k · x) — the mean-centred norm with bias
+                    // and its own 1e-6 epsilon, like V3.2's — but NO rope: the arch is NoPE.
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: ix.attn_k,
+                        dst: ix_k,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: ix_hd,
+                        w_off: 0,
+                    });
+                    g.push(Op::LayerNorm {
+                        x: ix_k,
+                        weight: ix.k_norm,
+                        bias: ix.k_norm_b,
+                        dst: ix_k,
+                        rows: batch as u32,
+                        dim: ix_hd,
+                        eps: c.norm_eps,
+                    });
+                    // Pool gate `ig = indexer_compressor_gate · x`, then pack `[key | gate]` —
+                    // one 2·head_dim row per token for the cache.
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: ix.compressor_gate.expect("glm5next indexer without compressor_gate"),
+                        dst: ix_gate,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: ix_hd,
+                        w_off: 0,
+                    });
+                    g.push(Op::CopyStrided {
+                        src: ix_k,
+                        src_off: 0,
+                        src_stride: ix_hd,
+                        dst: ix_kg,
+                        dst_off: 0,
+                        dst_stride: 2 * ix_hd,
+                        rows: batch as u32,
+                        n: ix_hd,
+                    });
+                    g.push(Op::CopyStrided {
+                        src: ix_gate,
+                        src_off: 0,
+                        src_stride: ix_hd,
+                        dst: ix_kg,
+                        dst_off: ix_hd,
+                        dst_stride: 2 * ix_hd,
+                        rows: batch as u32,
+                        n: ix_hd,
+                    });
+                    g.push(Op::WriteKv {
+                        src: ix_kg,
+                        cache: v_cache[l],
+                        rows: batch as u32,
+                        row_stride: 2 * ix_hd,
+                        pos: start_pos as u32,
+                    });
+                    // Queries off the q_lora (`attn`), never cached, never roped.
+                    g.push(Op::Linear {
+                        x: attn,
+                        weight: ix.attn_q_b,
+                        dst: ix_q,
+                        m: batch as u32,
+                        in_f: c.q_lora_rank as u32,
+                        out_f: ix_nh * ix_hd,
+                        w_off: 0,
+                    });
+                    // Per-head weights, UNSCALED — the op folds `1/sqrt(hd·nh)` into `w`.
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: ix.proj,
+                        dst: ix_w,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: ix_nh,
+                        w_off: 0,
+                    });
+                    g.push(Op::GlmKpoolIndexer {
+                        q: ix_q,
+                        k_cache: v_cache[l],
+                        ape: ix
+                            .compressor_ape
+                            .expect("glm5next indexer without compressor_ape"),
+                        weights: ix_w,
+                        dst: ix_topk,
+                        rows: batch as u32,
+                        kv_len,
+                        n_head: ix_nh,
+                        head_dim: ix_hd,
+                        kpool: c.indexer_kpool as u32,
+                        top_k: ix_top_k as u32,
+                        scale: 1.0 / ((ix_hd * ix_nh) as f32).sqrt(),
+                        pos: start_pos as u32,
+                    });
+                    g.push(Op::TopkMask {
+                        idx: ix_topk,
+                        dst: ix_mask,
+                        rows: batch as u32,
+                        kv_len,
+                        top_k: ix_top_k as u32,
+                    });
+                    Some(ix_mask)
+                } else {
+                    match mw.indexer.as_ref().filter(|_| !c.glm5next) {
                     None => {
                         assert!(
                             !c.deepseek32,
@@ -6493,6 +6623,7 @@ fn generate_dense_backend_inner(
                         });
                         Some(ix_mask)
                     }
+                }
                 };
 
                 // KV: wkv_a_mqa → mla_k16 (f32). Split into kv_cmpr and k_pe, norm+rope, reassemble.

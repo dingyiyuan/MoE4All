@@ -1755,7 +1755,14 @@ pub(crate) fn kv_default_q8(cfg: &Config, ec: &EngineConfig) -> bool {
 /// exist yet.
 pub(crate) fn kv_row_elems(cfg: &Config, l: usize) -> (usize, usize) {
     if cfg.is_mla_layer(l) {
-        return (cfg.kv_lora_rank + cfg.qk_rope_dim, cfg.indexer_head_size);
+        // glm5next's kpool indexer caches `[key | gate]` per token — TWICE the key length; the
+        // pool gate rides the same row so one `WriteKv` lands both halves the op reads.
+        let v = if cfg.glm5next {
+            2 * cfg.indexer_head_size
+        } else {
+            cfg.indexer_head_size
+        };
+        return (cfg.kv_lora_rank + cfg.qk_rope_dim, v);
     }
     if cfg.is_recurrent_layer(l) {
         return (0, 0);

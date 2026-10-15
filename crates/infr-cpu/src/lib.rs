@@ -4633,6 +4633,143 @@ impl Backend for CpuBackend {
                         });
                     vals[dst.0 as usize] = out;
                 }
+                Op::GlmKpoolIndexer {
+                    q,
+                    k_cache,
+                    ape,
+                    weights,
+                    dst,
+                    rows,
+                    kv_len,
+                    n_head,
+                    head_dim,
+                    kpool,
+                    top_k,
+                    scale,
+                    pos,
+                } => {
+                    let (rows, kv_len, nh, hd, kp, tk, pos) = (
+                        rows as usize,
+                        kv_len as usize,
+                        n_head as usize,
+                        head_dim as usize,
+                        kpool as usize,
+                        top_k as usize,
+                        pos as usize,
+                    );
+                    assert!(
+                        kp >= 2 && kp <= 8 && tk % kp == 0,
+                        "cpu Op::GlmKpoolIndexer: kpool {kp} / top_k {tk} — the graph builder must \
+                         pass the GGUF's `attention.indexer.kpool` and a token-count top_k"
+                    );
+                    let qs = &vals[q.0 as usize];
+                    let ws = &vals[weights.0 as usize];
+                    // The APE is a WEIGHT (the graph binds it), not interpreter state.
+                    let apw = weight(ape);
+                    let ap = &apw[..];
+                    let kbuf = bindings
+                        .get(k_cache)
+                        .expect("cpu backend: unbound indexer k_cache");
+                    let kguard = cpu_buf(kbuf).read();
+                    let row_w = 2 * hd;
+                    let cap_rows = g.desc(k_cache).numel() / row_w.max(1);
+                    assert!(
+                        cap_rows >= kv_len,
+                        "cpu Op::GlmKpoolIndexer: indexer cache holds {cap_rows} rows but kv_len \
+                         is {kv_len}"
+                    );
+                    // `[key | gate]` rows dequantised to f32, like `Op::LightningIndexer`'s cache.
+                    let ks = dequant_cache_prefix(&kguard, g.desc(k_cache).dtype, kv_len * row_w);
+                    // Pool the complete pools plus a possible incomplete tail: missing members
+                    // contribute key = 0, gate = 0 (the reference's zeroed dump row), so their
+                    // `ape` logits still join the per-channel softmax.
+                    let n_pool = kv_len.div_ceil(kp);
+                    let mut pooled = vec![0f32; n_pool * hd];
+                    for p in 0..n_pool {
+                        let real = kp.min(kv_len - p * kp);
+                        for d in 0..hd {
+                            let mut lg = [0f32; 8];
+                            let mut mx = f32::NEG_INFINITY;
+                            for s in 0..kp {
+                                let gate = if s < real {
+                                    ks[(p * kp + s) * row_w + hd + d]
+                                } else {
+                                    0.0
+                                };
+                                lg[s] = gate + ap[s * hd + d];
+                                if lg[s] > mx {
+                                    mx = lg[s];
+                                }
+                            }
+                            let mut acc = 0f32;
+                            let mut den = 0f32;
+                            for s in 0..real {
+                                let wgt = (lg[s] - mx).exp();
+                                den += wgt;
+                                acc += wgt * ks[(p * kp + s) * row_w + d];
+                            }
+                            for s in real..kp {
+                                den += (lg[s] - mx).exp();
+                            }
+                            pooled[p * hd + d] = acc / den;
+                        }
+                    }
+                    let n_keep = tk / kp;
+                    let mut out = vec![0f32; rows * tk];
+                    for (ti, slotrow) in out.chunks_exact_mut(tk).enumerate() {
+                        // Pool p is visible when its FIRST member is at or before the query.
+                        let qpos = pos + ti;
+                        let n_vis = (qpos / kp + 1).min(n_pool);
+                        let n_sel = n_vis.min(n_keep);
+                        // score[p] over the visible prefix: the LightningIndexer head sum over
+                        // pooled keys, ASCENDING h (ggml_sum_rows order).
+                        let mut sc = vec![0f32; n_vis];
+                        for (p, s) in sc.iter_mut().enumerate() {
+                            let pb = p * hd;
+                            let mut acc = 0f32;
+                            for h in 0..nh {
+                                let qo = (ti * nh + h) * hd;
+                                let d =
+                                    crate::kernels::dot(&qs[qo..qo + hd], &pooled[pb..pb + hd]);
+                                acc += (ws[ti * nh + h] * scale) * d.max(0.0);
+                            }
+                            *s = acc;
+                        }
+                        // Select n_sel pools by (score DESC, pool ASC) — the strict-better scan
+                        // `Op::LightningIndexer` uses, so ties keep the lower pool index.
+                        let mut taken = vec![false; n_vis];
+                        let mut w = 0usize;
+                        for _ in 0..n_sel {
+                            let mut bi = usize::MAX;
+                            for p in 0..n_vis {
+                                if taken[p] {
+                                    continue;
+                                }
+                                if bi == usize::MAX || sc[p] > sc[bi] {
+                                    bi = p;
+                                }
+                            }
+                            taken[bi] = true;
+                            // Emit the pool's members ascending; the incomplete tail pool clamps
+                            // its members to the real token count (duplicates keep every slot a
+                            // valid index — TopkMask's write is idempotent).
+                            let real = kp.min(kv_len - bi * kp);
+                            for m in 0..kp {
+                                if w >= tk {
+                                    break;
+                                }
+                                let tok = (bi * kp + m.min(real - 1)) as u32;
+                                slotrow[w] = f32::from_bits(tok);
+                                w += 1;
+                            }
+                        }
+                        // Remaining slots (fewer pools than the budget) repeat token 0.
+                        for x in slotrow[w..].iter_mut() {
+                            *x = 0f32;
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
                 Op::TopkMask {
                     idx,
                     dst,
