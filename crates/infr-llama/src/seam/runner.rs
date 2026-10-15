@@ -2281,6 +2281,20 @@ fn generate_dense_backend_inner(
                     }
                     let bytes = expanded.iter().flat_map(|&x| x.to_le_bytes()).collect();
                     (WBytes::Owned(bytes), DType::F32, expanded.len())
+                } else if c.glm5next && name.ends_with(".ssm_a") {
+                    // GLM stores `ssm_a` as `-exp(A_log)` and the reference scores the KDA decay
+                    // as `lower_bound * sigmoid(-gate * A)` (`glm5-next.cpp`), while the shared
+                    // Kda op computes `lower_bound * sigmoid(gate * a)` — bailing's convention,
+                    // where the GGUF stores the sign the op wants. Negating the 64 f32 at upload
+                    // makes the two conventions coincide exactly; no op or Vulkan change.
+                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    let mut v: Vec<f32> = bytemuck::cast_slice(tb.as_ref()).to_vec();
+                    for x in v.iter_mut() {
+                        *x = -*x;
+                    }
+                    let numel = v.len();
+                    let bytes = v.iter().flat_map(|&x| x.to_le_bytes()).collect();
+                    (WBytes::Owned(bytes), DType::F32, numel)
                 } else if ((c.deepseek2 || c.bailingmoe3 || c.glm5next)
                     && (name.ends_with("attn_k_b.weight") || name.ends_with("attn_v_b.weight")))
                     || (c.deepseek4
