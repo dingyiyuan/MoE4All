@@ -5427,7 +5427,7 @@ fn generate_dense_backend_inner(
             // because its GGUF omits both optional keys. `infr_core::graph::swiglu_clamp` owns the
             // `limit > 1e-6` disabled gate; passing a non-clamping layer's raw 0.0 through as
             // `Some(0.0)` would clamp that whole FFN to zero. `None` for every other arch.
-            let (clamp_exp, clamp_shexp) = if c.deepseek4 || c.bailingmoe3 {
+            let (clamp_exp, clamp_shexp) = if c.deepseek4 || c.bailingmoe3 || c.glm5next {
                 (
                     infr_core::graph::swiglu_clamp(c.swiglu_clamp_exp[l]),
                     infr_core::graph::swiglu_clamp(c.swiglu_clamp_shexp[l]),
@@ -7339,7 +7339,14 @@ fn generate_dense_backend_inner(
                         rows: batch as u32,
                         nff: nff_l as u32,
                         act,
-                        swiglu_clamp: None,
+                        // glm5next's `swiglu_clamp_exp` array covers the DENSE lead layers too
+                        // (llama.cpp's `build_ffn` reads it for every `il`); every other arch has
+                        // no clamp key and gets `None` exactly as before.
+                        swiglu_clamp: if c.glm5next {
+                            infr_core::graph::swiglu_clamp(c.swiglu_clamp_exp[l])
+                        } else {
+                            None
+                        },
                     });
                     // bitnet SubLN: RMSNorm the FFN intermediate (`actbuf`, width `nff_l`) BEFORE
                     // the down projection — matches llama.cpp `build_bitnet`'s `ffn_sub_norm`.
@@ -7393,7 +7400,12 @@ fn generate_dense_backend_inner(
                         up_stride: 0,
                         gate_stride: 0,
                         gate_block_width: 0,
-                        swiglu_clamp: None,
+                        // glm5next dense-lead clamp — see the `GatedActFused` arm above.
+                        swiglu_clamp: if c.glm5next {
+                            infr_core::graph::swiglu_clamp(c.swiglu_clamp_exp[l])
+                        } else {
+                            None
+                        },
                     });
                     // bitnet SubLN: RMSNorm the FFN intermediate BEFORE the down projection (see the
                     // `FfnW::DenseFused` arm above; same `ffn_sub_norm` from llama.cpp `build_bitnet`).
