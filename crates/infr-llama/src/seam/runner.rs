@@ -2376,21 +2376,6 @@ fn generate_dense_backend_inner(
             } else {
                 wload(&[&p("attn_norm.weight")])?;
             }
-            if c.glm5next {
-                // glm5next.cpp reads the SAME (fn, base, scale) hyper-connection triples as
-                // deepseek4 on every trunk block (the NextN block carries none — the trunk loop
-                // stops before it) — but keeps the plain `attn_norm` above: no HC input norm.
-                for name in [
-                    "hc_attn_fn.weight",
-                    "hc_attn_base.weight",
-                    "hc_attn_scale.weight",
-                    "hc_ffn_fn.weight",
-                    "hc_ffn_base.weight",
-                    "hc_ffn_scale.weight",
-                ] {
-                    wload(&[&p(name)])?;
-                }
-            }
             if is_mla {
                 // MLA: wq_a → q_a_norm → wq_b (or wq for lite), wkv_a_mqa, kv_a_norm, wk_b, wv_b, wo.
                 if !c.is_lite {
@@ -2567,6 +2552,22 @@ fn generate_dense_backend_inner(
             // no single `attn_output` tensor, so it is excluded here alongside MLA and DeltaNet.
             if !is_delta && !is_mla && !is_kda && !is_dsv4 {
                 wload(&[&p("attn_output.weight")])?;
+            }
+            if c.glm5next {
+                // glm5next's hyper-connections: the SAME (fn, base, scale) × (attn, ffn) triples
+                // deepseek4 uploads, on every trunk block (the NextN block carries none — the trunk
+                // loop stops before it), beside the plain `attn_norm`: no HC input norm. Uploaded
+                // after the mixer chain to mirror the `hc` `wpush` slot in `build`.
+                for name in [
+                    "hc_attn_fn.weight",
+                    "hc_attn_base.weight",
+                    "hc_attn_scale.weight",
+                    "hc_ffn_fn.weight",
+                    "hc_ffn_base.weight",
+                    "hc_ffn_scale.weight",
+                ] {
+                    wload(&[&p(name)])?;
+                }
             }
             if c.qwen4exp && c.is_qwen_hybrid_attn_layer(l) {
                 if fuse_qsa_prepare {
@@ -2821,7 +2822,7 @@ fn generate_dense_backend_inner(
         // `ggml_rms_norm` there). `Op::RmsNorm` requires a weight, so — exactly like the three
         // ones-vectors above — one `hc_mult*n_embd`-wide vector of 1.0 serves all of them
         // (`x * s * 1.0 == x * s` in IEEE). See the matching `hc_ones` handle in `build`.
-        if c.deepseek4 {
+        if c.deepseek4 || c.glm5next {
             let ones = vec![1.0f32; c.hc_mult * ne];
             let b = be
                 .alloc(ones.len() * 4, BufferUsage::Weights)
@@ -4138,12 +4139,16 @@ fn generate_dense_backend_inner(
                 // arm above — `wpush` consumes `wspecs` SEQUENTIALLY, so a missing or reordered
                 // declaration here would bind every later weight in the layer one buffer off,
                 // silently.
-                let indexer = c.deepseek32.then(|| IndexerW {
+                let indexer = (c.deepseek32 || c.glm5next).then(|| IndexerW {
                     k_norm: wpush(&mut g, &mut weights),
                     k_norm_b: wpush(&mut g, &mut weights),
                     proj: wpush(&mut g, &mut weights),
                     attn_k: wpush(&mut g, &mut weights),
                     attn_q_b: wpush(&mut g, &mut weights),
+                    // glm5next's kpool-4 compressor pair, uploaded right after the five V3.2
+                    // tensors; V3.2 scores every token directly and has None here.
+                    compressor_ape: c.glm5next.then(|| wpush(&mut g, &mut weights)),
+                    compressor_gate: c.glm5next.then(|| wpush(&mut g, &mut weights)),
                 });
                 MixerW::Mla(MlaW {
                     wq_a,
@@ -4170,11 +4175,15 @@ fn generate_dense_backend_inner(
                     qkv,
                     conv: wpush(&mut g, &mut weights),
                     forget: wpush(&mut g, &mut weights),
+                    // glm5next's second-stage low-rank projections, uploaded right after their
+                    // first-stage twins (`ssm_f_b` after `ssm_f_a`, `ssm_g_b` after `ssm_g_a`).
+                    forget_b: c.glm5next.then(|| wpush(&mut g, &mut weights)),
                     beta: wpush(&mut g, &mut weights),
                     a: wpush(&mut g, &mut weights),
                     dt_bias: wpush(&mut g, &mut weights),
                     norm: wpush(&mut g, &mut weights),
                     gate: wpush(&mut g, &mut weights),
+                    gate_b: c.glm5next.then(|| wpush(&mut g, &mut weights)),
                     out: wpush(&mut g, &mut weights),
                 })
             } else if is_delta {
@@ -4270,9 +4279,10 @@ fn generate_dense_backend_inner(
                     qsa,
                 })
             };
-            // DeepSeek V4's two hyper-connection triples, in `wload`'s order: attn `(fn, base,
-            // scale)` then ffn `(fn, base, scale)`.
-            let hc = c.deepseek4.then(|| LayerHcW {
+            // DeepSeek V4's and glm5next's two hyper-connection triples, in `wload`'s order: attn
+            // `(fn, base, scale)` then ffn `(fn, base, scale)`. Both archs carry them on EVERY
+            // trunk layer; glm5next reuses the tensor names AND this slot verbatim.
+            let hc = (c.deepseek4 || c.glm5next).then(|| LayerHcW {
                 attn: HcTriple {
                     w_fn: wpush(&mut g, &mut weights),
                     base: wpush(&mut g, &mut weights),
@@ -4569,10 +4579,10 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
-        // DeepSeek V4's `hc_mult*n_embd`-wide ones-vector for the weightless RMSNorm that feeds
-        // every hyper-connection mixing matmul — upload order matches the `if c.deepseek4` block
-        // at the end of the weight loop above.
-        let hc_ones = if c.deepseek4 {
+        // DeepSeek V4's / glm5next's `hc_mult*n_embd`-wide ones-vector for the weightless RMSNorm
+        // that feeds every hyper-connection mixing matmul — upload order matches the
+        // `if c.deepseek4 || c.glm5next` block at the end of the weight loop above.
+        let hc_ones = if c.deepseek4 || c.glm5next {
             Some(wpush(&mut g, &mut weights))
         } else {
             None
@@ -4667,7 +4677,7 @@ fn generate_dense_backend_inner(
         //   hc_pre / hc_post   [batch, hc]      collapse weights / per-stream output gates
         //   hc_comb    [batch, hc, hc]          Sinkhorn-normalised mixing matrix
         let hcw = c.hc_mult * ne;
-        let (hcr, hc_normed) = if c.deepseek4 {
+        let (hcr, hc_normed) = if c.deepseek4 || c.glm5next {
             (
                 [
                     g.internal(f32d(batch * hcw.max(1))),
@@ -4852,8 +4862,17 @@ fn generate_dense_backend_inner(
         let dn_out = g.internal(f32d(batch * q35_vdim.max(1)));
         // Ling KDA adds a vector forget projection, while its MLA layers add one gate scalar per
         // head. Both are shared scratch across mutually-exclusive layer mixer arms.
-        let kda_forget = if c.bailingmoe3 {
+        let kda_forget = if c.bailingmoe3 || c.glm5next {
             g.internal(f32d(batch * c.ssm_d_inner.max(1)))
+        } else {
+            g.internal(f32d(1))
+        };
+        // glm5next's forget/gate are TWO-stage low-rank (`glm5-next.cpp`: `f_a` [n_embd, head_dim]
+        // then `f_b` [head_dim, d_inner], the `g` pair identical). One `head_dim`-wide row buffer
+        // carries each stage-1 output; the two chains run serially (forget before the scan, gate
+        // after), so one buffer serves both.
+        let kda_rank = if c.glm5next {
+            g.internal(f32d(batch * c.kda_head_dim.max(1)))
         } else {
             g.internal(f32d(1))
         };
@@ -5244,8 +5263,10 @@ fn generate_dense_backend_inner(
         // and neither it nor `docs/backlog.md` § B-DSV4-WIRING records how the reference seeds the
         // widened stream. Replicating the input across streams is what the hyper-connections
         // formulation calls for and what makes the head's collapse a partition of unity at depth 0;
-        // it is recorded as unverified in `docs/backlog.md` § B-DSV4-HC.
-        if c.deepseek4 {
+        // it is recorded as unverified in `docs/backlog.md` § B-DSV4-HC. glm5next VERIFIES it:
+        // `glm5-next.cpp` seeds the streams with `ggml_repeat_4d(inp, n_embd, hc, n_tokens, 1)`
+        // ("hc_init") — the same replication, from the reference itself.
+        if c.deepseek4 || c.glm5next {
             for h in 0..c.hc_mult {
                 g.push(Op::CopyStrided {
                     src: hidden,
@@ -5692,15 +5713,41 @@ fn generate_dense_backend_inner(
                     channels: packed as u32,
                     kernel: c.ssm_d_conv as u32,
                 });
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: kw.forget,
-                    dst: kda_forget,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: inner as u32,
-                    w_off: 0,
-                });
+                match kw.forget_b {
+                    // glm5next: `forget = f_b · f_a · x` — two Linears, the rank-128 intermediate
+                    // in `kda_rank` (`glm5-next.cpp::build_kda_layer`, the `f_a`/`g1` pair). The
+                    // `Op::Kda` op still receives the FULL `inner`-wide forget row + `dt_bias`,
+                    // exactly like Ling's single-stage form.
+                    Some(fb) => {
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: kw.forget,
+                            dst: kda_rank,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: c.kda_head_dim as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::Linear {
+                            x: kda_rank,
+                            weight: fb,
+                            dst: kda_forget,
+                            m: batch as u32,
+                            in_f: c.kda_head_dim as u32,
+                            out_f: inner as u32,
+                            w_off: 0,
+                        });
+                    }
+                    None => g.push(Op::Linear {
+                        x: hn,
+                        weight: kw.forget,
+                        dst: kda_forget,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: inner as u32,
+                        w_off: 0,
+                    }),
+                }
                 g.push(Op::Linear {
                     x: hn,
                     weight: kw.beta,
@@ -5724,15 +5771,38 @@ fn generate_dense_backend_inner(
                     eps,
                     lower_bound: c.kda_gate_lower_bound,
                 });
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: kw.gate,
-                    dst: dn_zbuf,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: inner as u32,
-                    w_off: 0,
-                });
+                match kw.gate_b {
+                    // glm5next's output gate is the `g_a`/`g_b` twin of the forget pair above.
+                    Some(gb) => {
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: kw.gate,
+                            dst: kda_rank,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: c.kda_head_dim as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::Linear {
+                            x: kda_rank,
+                            weight: gb,
+                            dst: dn_zbuf,
+                            m: batch as u32,
+                            in_f: c.kda_head_dim as u32,
+                            out_f: inner as u32,
+                            w_off: 0,
+                        });
+                    }
+                    None => g.push(Op::Linear {
+                        x: hn,
+                        weight: kw.gate,
+                        dst: dn_zbuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: inner as u32,
+                        w_off: 0,
+                    }),
+                }
                 g.push(Op::QkNorm {
                     x: dn_out,
                     weight: Some(kw.norm),
@@ -6252,7 +6322,13 @@ fn generate_dense_backend_inner(
                 // The emit reads `mw.indexer`, NOT `c.deepseek32`: a V3.2 model whose indexer
                 // weights were not captured therefore takes the `else` below and FAILS loudly,
                 // instead of quietly running the deepseek2 graph over every key.
-                let key_mask = match &mw.indexer {
+                // glm5next INTENTIONALLY falls through to the dense deepseek2 mask for now: its
+                // indexer is a kpool-4 POOL scorer (`glm5-next.cpp::build_kpool_select` — pooled
+                // keys + APE softmax + gate, no rope on the indexer heads), which shares nothing
+                // with V3.2's per-token rope'd lightning indexer emitted below. The pool graph is
+                // M2 wiring; dense attention over every key keeps the trunk numerically honest in
+                // shape while it lands.
+                let key_mask = match mw.indexer.as_ref().filter(|_| !c.glm5next) {
                     None => {
                         assert!(
                             !c.deepseek32,
@@ -7839,6 +7915,48 @@ fn generate_dense_backend_inner(
                 rows: batch as u32,
                 hc: c.hc_mult as u32,
                 n_embd: ne as u32,
+            });
+        }
+        // glm5next's model head: NO learned collapse triple (the GGUF carries no `output_hc_*`) —
+        // `glm5-next.cpp::build_hc_mean` collapses the streams with a plain MEAN: sum the
+        // `hc_mult` streams, scale by 1/hc, then `output_norm`. One stream at a time through
+        // `hc_normed`'s head (wide enough, and dead after the last wrap's pre), summed into
+        // `hidden`, which the LM-head tail reads like every other arch does.
+        if c.glm5next {
+            let hc = c.hc_mult as u32;
+            g.push(Op::CopyStrided {
+                src: hcr[0],
+                src_off: 0,
+                src_stride: hcw as u32,
+                dst: hidden,
+                dst_off: 0,
+                dst_stride: ne as u32,
+                rows: batch as u32,
+                n: ne as u32,
+            });
+            for h in 1..c.hc_mult {
+                g.push(Op::CopyStrided {
+                    src: hcr[0],
+                    src_off: (h * ne) as u32,
+                    src_stride: hcw as u32,
+                    dst: hc_normed,
+                    dst_off: 0,
+                    dst_stride: ne as u32,
+                    rows: batch as u32,
+                    n: ne as u32,
+                });
+                g.push(Op::Add {
+                    a: hidden,
+                    b: hc_normed,
+                    dst: hidden,
+                    n: (batch * ne) as u32,
+                });
+            }
+            g.push(Op::Scale {
+                x: hidden,
+                dst: hidden,
+                s: 1.0 / hc as f32,
+                n: (batch * ne) as u32,
             });
         }
         if l_end == c.n_layer {

@@ -164,11 +164,17 @@ pub(super) struct KdaW {
     pub(super) qkv: KdaQkvW,
     pub(super) conv: TensorId,
     pub(super) forget: TensorId,
+    /// glm5next's SECOND-stage forget projection `[rank, n_head * kda_head_dim]` — the forget gate
+    /// is two-stage low-rank (`ssm_f_a` then `ssm_f_b`), where Ling carries one stage. `Some`
+    /// exactly when `Config::glm5next`; pushed right after `forget` to mirror the upload order.
+    pub(super) forget_b: Option<TensorId>,
     pub(super) beta: TensorId,
     pub(super) a: TensorId,
     pub(super) dt_bias: TensorId,
     pub(super) norm: TensorId,
     pub(super) gate: TensorId,
+    /// glm5next's SECOND-stage gate projection, the `ssm_g_b` twin of [`Self::forget_b`].
+    pub(super) gate_b: Option<TensorId>,
     pub(super) out: TensorId,
 }
 
@@ -223,6 +229,13 @@ pub(super) struct IndexerW {
     /// `indexer.attn_q_b.weight` `[q_lora_rank, indexer_n_head * indexer_head_size]` — the indexer
     /// queries, read off the SAME normed low-rank `qr` that `wq_b` consumes.
     pub(super) attn_q_b: TensorId,
+    /// glm5next's key-pooling compressor APE `[kpool, key_length]` — the learned per-slot position
+    /// embedding of the kpool-4 pool (`glm5next.cpp`'s `indexer_compressor_ape`). `Some` exactly
+    /// when `Config::glm5next`; V3.2 scores every token directly and has no pool.
+    pub(super) compressor_ape: Option<TensorId>,
+    /// glm5next's key-pooling gate `[n_embd, key_length]` — projects the token input to pool the
+    /// kpool consecutive key rows with (`indexer_compressor_gate`). Same `glm5next`-only rule.
+    pub(super) compressor_gate: Option<TensorId>,
 }
 
 /// DeepSeek V4's attention-mixer weights shared by all three compression tiers.
@@ -289,7 +302,8 @@ pub(super) struct HcTriple {
 }
 
 /// The two per-layer hyper-connection triples: one wrapping the attention sublayer, one the FFN.
-/// Both are unconditional on every V4 layer (`hc_attn_*` / `hc_ffn_*`).
+/// Both are unconditional on every V4 layer (`hc_attn_*` / `hc_ffn_*`) — and on every glm5next
+/// trunk layer, which reuses the same tensor names and the (fn, base, scale) triple shape.
 pub(super) struct LayerHcW {
     pub(super) attn: HcTriple,
     pub(super) ffn: HcTriple,
