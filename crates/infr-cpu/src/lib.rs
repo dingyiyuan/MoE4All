@@ -6177,4 +6177,176 @@ mod tests {
         );
         assert!(CpuBackend::reference().cfg.kernels.cpu.reference);
     }
+
+    // The glm5next k-pool indexer: synthetic cache, gate = ape = 0, so every pool's pooled key
+    // is the plain mean of its members and the score is `relu(dot(q, pooled))` — everything the
+    // op promises (visibility bound, top-pool selection with pool-ASC ties, member expansion,
+    // tail-pool clamping, and token-0 padding) is then exactly checkable.
+    #[test]
+    fn glm_kpool_indexer_selects_pools_and_pads() {
+        let (kv_len, kp, tk) = (10usize, 4usize, 8usize);
+        let (nh, hd) = (2usize, 4usize);
+        let rows = 9usize; // queries at pos 0..=8
+        // Pool keys: pool 0 -> 1.0, pool 1 -> 2.0, pool 2 (tokens 8,9 + two missing) -> 0.5.
+        let mut cache = vec![0f32; kv_len * 2 * hd];
+        for t in 0..kv_len {
+            let v = match t / kp {
+                0 => 1.0,
+                1 => 2.0,
+                _ => 0.5,
+            };
+            for d in 0..hd {
+                cache[t * 2 * hd + d] = v; // key
+                                      // gate stays 0
+            }
+        }
+        // q[t][h][d] = 1.0 in channel 0, 0 elsewhere; weights 1; scale 1 -> score = pooled[0].
+        let mut q = vec![0f32; rows * nh * hd];
+        for t in 0..rows {
+            for h in 0..nh {
+                q[t * nh * hd + h * hd] = 1.0;
+            }
+        }
+        let w = vec![1f32; rows * nh];
+        let ape = vec![0f32; kp * hd];
+
+        let backend = CpuBackend::new();
+        let mut g = Graph::new();
+        let qi = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        let wi = g.input(TensorDesc::new(vec![rows, nh], DType::F32));
+        let aw = g.weight(TensorDesc::new(vec![kp * hd], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![kv_len * 2 * hd], DType::F32));
+        let di = g.output(TensorDesc::new(vec![rows * tk], DType::I32));
+        g.push(Op::GlmKpoolIndexer {
+            q: qi,
+            k_cache: kc,
+            ape: aw,
+            weights: wi,
+            dst: di,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            kpool: kp as u32,
+            top_k: tk as u32,
+            scale: 1.0,
+            pos: 0,
+        });
+        let plan = backend.compile(&g).expect("compile");
+        let qb = backend.alloc(q.len() * 4, BufferUsage::Activations).unwrap();
+        let wb = backend.alloc(w.len() * 4, BufferUsage::Activations).unwrap();
+        let ab = backend.alloc(ape.len() * 4, BufferUsage::Weights).unwrap();
+        let kb = backend.alloc(cache.len() * 4, BufferUsage::KvCache).unwrap();
+        let db = backend.alloc(rows * tk * 4, BufferUsage::Readback).unwrap();
+        backend.upload(qb.as_ref(), bytemuck::cast_slice(&q)).unwrap();
+        backend.upload(wb.as_ref(), bytemuck::cast_slice(&w)).unwrap();
+        backend.upload(ab.as_ref(), bytemuck::cast_slice(&ape)).unwrap();
+        backend.upload(kb.as_ref(), bytemuck::cast_slice(&cache)).unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(qi, qb.as_ref())
+            .bind(wi, wb.as_ref())
+            .bind(aw, ab.as_ref())
+            .bind(kc, kb.as_ref())
+            .bind(di, db.as_ref());
+        backend.execute(plan.as_ref(), &bindings).expect("execute");
+        let mut out = vec![0u8; rows * tk * 4];
+        backend.download(db.as_ref(), &mut out).unwrap();
+        let got: Vec<u32> = bytemuck::cast_slice::<u8, i32>(&out)
+            .iter()
+            .map(|v| *v as u32)
+            .collect();
+
+        // pos 0..3 see ONLY pool 0 -> its 4 members, then token-0 padding (idempotent under
+        // TopkMask, and every slot must be a valid index — no -1 sentinel).
+        for t in 0..4 {
+            assert_eq!(&got[t * tk..t * tk + tk], &[0, 1, 2, 3, 0, 0, 0, 0], "row {t}");
+        }
+        // pos 4..7 see pools 0-1; pool 1 scores higher -> members first, pool 0 second.
+        for t in 4..8 {
+            assert_eq!(&got[t * tk..t * tk + tk], &[4, 5, 6, 7, 0, 1, 2, 3], "row {t}");
+        }
+        // pos 8 adds the incomplete tail pool (score 0.5, between the other two) -> pool 1 then
+        // pool 0; the tail pool is visible but never wins here.
+        assert_eq!(&got[8 * tk..8 * tk + tk], &[4, 5, 6, 7, 0, 1, 2, 3], "row 8");
+    }
+
+    // The tail pool's MISSING members clamp to the last real token (every emitted index stays
+    // < kv_len, which TopkMask asserts) and the pooled mean divides by the FULL kpool (the
+    // reference's zeroed dump row joins the softmax with key = 0).
+    #[test]
+    fn glm_kpool_indexer_tail_pool_clamps_members() {
+        let (kv_len, kp, tk) = (10usize, 4usize, 4usize); // budget = ONE pool
+        let (nh, hd) = (1usize, 2usize);
+        let rows = 1usize; // query at pos 9 -> all three pools visible
+        // NB: `pos` is the ROW-0 position (the LightningIndexer convention), so the query at
+        // row 0 sits at `pos` itself — pos 8, not 9.
+        let mut cache = vec![0f32; kv_len * 2 * hd];
+        for t in 0..kv_len {
+            let v = match t / kp {
+                0 => 1.0,
+                1 => 2.0,
+                _ => 3.0, // tail pool scores HIGHEST
+            };
+            for d in 0..hd {
+                cache[t * 2 * hd + d] = v;
+            }
+        }
+        let q = vec![1f32; rows * nh * hd];
+        let w = vec![1f32; rows * nh];
+        let ape = vec![0f32; kp * hd];
+        let backend = CpuBackend::new();
+        let mut g = Graph::new();
+        let qi = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        let wi = g.input(TensorDesc::new(vec![rows, nh], DType::F32));
+        let aw = g.weight(TensorDesc::new(vec![kp * hd], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![kv_len * 2 * hd], DType::F32));
+        let di = g.output(TensorDesc::new(vec![rows * tk], DType::I32));
+        g.push(Op::GlmKpoolIndexer {
+            q: qi,
+            k_cache: kc,
+            ape: aw,
+            weights: wi,
+            dst: di,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            kpool: kp as u32,
+            top_k: tk as u32,
+            scale: 1.0,
+            pos: 8,
+        });
+        let plan = backend.compile(&g).expect("compile");
+        let qb = backend.alloc(q.len() * 4, BufferUsage::Activations).unwrap();
+        let wb = backend.alloc(w.len() * 4, BufferUsage::Activations).unwrap();
+        let ab = backend.alloc(ape.len() * 4, BufferUsage::Weights).unwrap();
+        let kb = backend.alloc(cache.len() * 4, BufferUsage::KvCache).unwrap();
+        let db = backend.alloc(rows * tk * 4, BufferUsage::Readback).unwrap();
+        backend.upload(qb.as_ref(), bytemuck::cast_slice(&q)).unwrap();
+        backend.upload(wb.as_ref(), bytemuck::cast_slice(&w)).unwrap();
+        backend.upload(ab.as_ref(), bytemuck::cast_slice(&ape)).unwrap();
+        backend.upload(kb.as_ref(), bytemuck::cast_slice(&cache)).unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(qi, qb.as_ref())
+            .bind(wi, wb.as_ref())
+            .bind(aw, ab.as_ref())
+            .bind(kc, kb.as_ref())
+            .bind(di, db.as_ref());
+        backend.execute(plan.as_ref(), &bindings).expect("execute");
+        let mut out = vec![0u8; rows * tk * 4];
+        backend.download(db.as_ref(), &mut out).unwrap();
+        let got: Vec<u32> = bytemuck::cast_slice::<u8, i32>(&out)
+            .iter()
+            .map(|v| *v as u32)
+            .collect();
+        // The winning tail pool emits 8, 9, then 9, 9 — the missing members clamp to the last
+        // real token instead of running past kv_len.
+        // The reference's zeroed dump row joins the softmax with key = 0, so the pooled mean
+        // divides by the FULL kpool: tail = (8+9)/4 = 4.25 < pool 1's 2.0 — the tail pool is
+        // visible but loses, and pool 1 wins the single slot.
+        assert_eq!(&got[..], &[4, 5, 6, 7]);
+    }
+
 }
