@@ -3569,7 +3569,7 @@ impl Backend for CpuBackend {
                     // — long enough that spinning pool workers SMT-throttled it, which is where
                     // qwen3moe's phase-3 prefill regression hid (per-op MoeFfn time had IMPROVED).
                     let logits_all: Vec<f32> = {
-                        let r_kind = expert_acts_kind(rdt, ne, int8_ok);
+                        let r_kind = expert_acts_kind(rdt, ne, int8_ok, !reference);
                         let rq8: Vec<Q8> = if r_kind == ActsKind::Super {
                             pool.collect(rows, &|r| quantize_q8(&rxs[r * ne..r * ne + ne]))
                         } else {
@@ -3893,11 +3893,11 @@ impl Backend for CpuBackend {
                     // per-expert gather re-quantized a row for every expert it routed to), then
                     // cloned per pair so each bucket owns a contiguous slice.
                     let t_a = std::time::Instant::now();
-                    let g_kind = expert_acts_kind(gdt, ne, int8_ok);
+                    let g_kind = expert_acts_kind(gdt, ne, int8_ok, !reference);
                     let u_kind = if fused_gate_up {
                         g_kind
                     } else {
-                        expert_acts_kind(udt, ne, int8_ok)
+                        expert_acts_kind(udt, ne, int8_ok, !reference)
                     };
                     let need = |k: ActsKind| g_kind == k || u_kind == k;
                     let q8_pairs: Vec<Q8> = if need(ActsKind::Super) {
@@ -4032,7 +4032,7 @@ impl Backend for CpuBackend {
                     // values the old un-transpose+split produced), quantized straight into the
                     // representation the DOWN bank's dtype wants.
                     let t_c = std::time::Instant::now();
-                    let d_kind = expert_acts_kind(ddt, nffx, int8_ok);
+                    let d_kind = expert_acts_kind(ddt, nffx, int8_ok, !reference);
                     let act_row_of = |p: usize| -> Vec<f32> {
                         let b = pair_bucket[p] as usize;
                         let i = pair_local[p] as usize;
@@ -4510,26 +4510,35 @@ impl Backend for CpuBackend {
                             for &s in &sc {
                                 l += (s - mx).exp();
                             }
-                            // Accumulate: V is first kv_lora columns of K.
+                            // Accumulate: V is first kv_lora columns of K. The value projection
+                            // factors through the softmax sum — `Σ_jj p_jj · (wv_b[h] @ V_jj) ==
+                            // wv_b[h] @ (Σ_jj p_jj V_jj)` — so the context vector is accumulated
+                            // in kv_lora space FIRST (kv_lora MACs per key) and `wv_b[h]` is
+                            // applied ONCE per (token, head). The old fused form re-projected
+                            // every key through the full [kv_lora, v_head] matrix, which made
+                            // prefill MLA quadratic-in-keys with a 512×512 constant — the single
+                            // hottest thing in glm5next CPU prefill (26% of a 34-minute run).
+                            // Same math, llama.cpp's association order, f32-reshuffled results.
+                            let mut ctx = vec![0f32; kv_lora];
                             for (jj, &s) in sc.iter().enumerate() {
                                 let j = lo + jj;
                                 let jr = if cap_rows > 0 { j % cap_rows } else { j };
                                 let p = (s - mx).exp() / l;
                                 let krow = jr * key_len;
-                                // attn_out[jj] += p * V[jj] where V[jj] = ks[krow..krow+kv_lora]
-                                // Apply wv_b[h] to the accumulated output directly:
-                                // ob_slice += p * wv_b[h] @ V[jj]
-                                let wv_off = h * kv_lora * vhd;
-                                for o_idx in 0..vhd {
-                                    let mut vs = 0f32;
-                                    for a_idx in 0..kv_lora {
-                                        // wv_b[h][a_idx][o_idx]: element [a][o] with a the FAST
-                                        // (row) dim — flat = a + o*kv_lora (GGUF layout).
-                                        vs +=
-                                            wv[wv_off + a_idx + o_idx * kv_lora] * ks[krow + a_idx];
-                                    }
-                                    ob_slice[o_idx] = p.mul_add(vs, ob_slice[o_idx]);
+                                // ctx += p * V[jj] where V[jj] = ks[krow..krow+kv_lora]
+                                for (c, &v) in ctx.iter_mut().zip(&ks[krow..krow + kv_lora]) {
+                                    *c = p.mul_add(v, *c);
                                 }
+                            }
+                            // ob = wv_b[h] @ ctx, once. wv_b[h][a][o] with a the FAST (row) dim —
+                            // flat = a + o*kv_lora (GGUF layout), so each output row is a
+                            // contiguous dot against the context.
+                            let wv_off = h * kv_lora * vhd;
+                            for o_idx in 0..vhd {
+                                ob_slice[o_idx] = crate::kernels::dot(
+                                    &wv[wv_off + o_idx * kv_lora..][..kv_lora],
+                                    &ctx,
+                                );
                             }
                         });
                     vals[dst.0 as usize] = out;
