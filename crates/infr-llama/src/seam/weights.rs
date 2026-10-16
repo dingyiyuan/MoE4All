@@ -402,6 +402,13 @@ pub(crate) struct SessionStable {
     pub(super) kda_qkv_fused: Vec<bool>,
     /// Whether the MoE expert banks all have a dp4a-mmq kernel (batched-prefill eligibility).
     pub(super) moe_batched_ok: bool,
+    /// Whether the MoE expert banks are IQ-grid dtypes the CPU Super batch kernels run at ANY
+    /// row count (glm5next: Iq2Xxs gate/up + Iq2S/Iq3Xxs down). The `MOE_MMQ_DTYPES` scan above
+    /// is the Vulkan dp4a-mmq story and carries no Iq2Xxs kernel, which stranded every glm5next
+    /// prefill on one token per submit; the CPU backend's `expert_acts_kind` Super path (the same
+    /// `vec_dot_iq*_batch` kernels `Op::Linear` runs for these formats) batches them instead.
+    /// CPU-only gate — see the `batched_prefill_ok` call site in `runner`.
+    pub(super) moe_super_batched_ok: bool,
 }
 
 pub(crate) struct SeamKv {

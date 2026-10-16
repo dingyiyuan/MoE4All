@@ -1073,6 +1073,36 @@ fn session_stable(
                 })
             }
     };
+    // CPU-only batched-prefill eligibility for the IQ-grid expert dtypes (glm5next). The mmq scan
+    // above is the Vulkan dp4a story; Iq2Xxs has no mmq kernel, yet the CPU MoE arm runs IQ banks
+    // through the Super q8-activation batch kernels (`expert_acts_kind`'s `iq_ok` admission, the
+    // same `vec_dot_iq*_batch` kernels `Op::Linear` uses) at ANY row count — so a chunked prefill
+    // is correct AND amortizes the per-token expert-weight streaming that made glm5next prefill
+    // ~17x off gold. Mirror the arm's dtype set and its `in_f % 256 == 0` super-block condition
+    // (in_f = the expert FFN width, the GEMM's input dimension).
+    let moe_super_ok = |d: Option<DType>| {
+        d.is_some_and(|dt| {
+            matches!(dt, DType::Iq2Xxs | DType::Iq2S | DType::Iq3Xxs)
+                && c.moe.as_ref().is_some_and(|m| m.n_ff_exp % 256 == 0)
+        })
+    };
+    let moe_super_batched_ok = c.moe.is_some() && {
+        let dt = |n: String| g.tensors().iter().find(|t| t.name == n).map(|t| t.dtype);
+        let moe_layers = || (0..c.n_layer).filter(|&l| c.is_moe_layer(l));
+        moe_layers().next().is_some()
+            && if c.dual_moe() {
+                moe_layers().all(|l| {
+                    moe_super_ok(dt(format!("blk.{l}.ffn_gate_up_exps.weight")))
+                        && moe_super_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
+                })
+            } else {
+                moe_layers().all(|l| {
+                    moe_super_ok(dt(format!("blk.{l}.ffn_gate_exps.weight")))
+                        && moe_super_ok(dt(format!("blk.{l}.ffn_up_exps.weight")))
+                        && moe_super_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
+                })
+            }
+    };
     Ok(SessionStable {
         has_wv,
         out_scale,
@@ -1086,6 +1116,7 @@ fn session_stable(
         fuse_qwen_hc_down_inject,
         kda_qkv_fused,
         moe_batched_ok,
+        moe_super_batched_ok,
     })
 }
 
@@ -2003,6 +2034,7 @@ fn generate_dense_backend_inner(
     let fuse_qwen_hc_down_inject = stable.fuse_qwen_hc_down_inject;
     let kda_qkv_fused = &stable.kda_qkv_fused;
     let moe_batched_ok = stable.moe_batched_ok;
+    let moe_super_batched_ok = stable.moe_super_batched_ok;
 
     // qwen35 DeltaNet silu-gated RMSNorm fusion (decode op-fusion campaign): QkNorm's per-head
     // rmsnorm write is immediately read-after-write by the z-gate GatedAct — a real barrier on
@@ -10950,7 +10982,11 @@ fn generate_dense_backend_inner(
             && matches!(v_fmt, DType::F16 | DType::Q8_0)
             && (be.moe_paged() || moe_batched_ok)
     } else {
-        (c.moe.is_none() || moe_batched_ok) && !c.deepseek4
+        // The CPU backend batches IQ-grid expert banks through its Super q8-activation kernels
+        // (see `session_stable`'s `moe_super_batched_ok`), so glm5next earns chunked prefill
+        // there even though Iq2Xxs has no dp4a-mmq kernel. Vulkan keeps the mmq-only gate.
+        (c.moe.is_none() || moe_batched_ok || (be.name() == "cpu" && moe_super_batched_ok))
+            && !c.deepseek4
     };
     let decode_start = if prompt.len() - start > 2 && batched_prefill_ok {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
