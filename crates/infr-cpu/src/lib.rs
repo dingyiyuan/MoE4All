@@ -4347,6 +4347,22 @@ impl Backend for CpuBackend {
                     let mut out = vec![0.0f32; rr * inner];
                     let qscale = 1.0 / (hd as f32).sqrt();
 
+                    // The recurrence's O(hd²) per (token, head) state walk is inherent; what made
+                    // this arm slow was pure redundancy ON TOP of it. (1) The decay gate depends on
+                    // (head, k) ONLY, yet both of its exp()s sat inside the `v` loop — hd² pairs per
+                    // head per token (32K exps at hd=128) where hd suffices. (2) The scaled key and
+                    // query projections were re-multiplied per v as well. (3) The v-outer/k-inner
+                    // nest strode `hd` floats per k through the [k][v]-major state; walking k-major
+                    // instead makes every row contiguous. Every output element still accumulates
+                    // over k ASCENDING and every state element is still decayed exactly once before
+                    // it is read, so the arithmetic is unchanged element-for-element.
+                    let mut decay = vec![0.0f32; hd];
+                    let mut ksc = vec![0.0f32; hd];
+                    let mut qsc = vec![0.0f32; hd];
+                    let mut pred_v = vec![0.0f32; hd];
+                    let mut delta_v = vec![0.0f32; hd];
+                    let mut obuf = vec![0.0f32; hd];
+
                     for t in 0..rr {
                         let row = t * 3 * inner;
                         for h in 0..nh {
@@ -4364,27 +4380,40 @@ impl Backend for CpuBackend {
                             let kinv = 1.0 / (kn + eps).sqrt();
                             let b = 1.0 / (1.0 + (-beta[t * nh + h]).exp());
                             let sbase = h * hd * hd;
+                            let ah = a[h];
+                            let fbase = t * inner + hv;
 
-                            for v in 0..hd {
-                                let mut pred = 0.0f32;
-                                for k in 0..hd {
-                                    let gate =
-                                        a[h] * (forget[t * inner + hv + k] + dt_bias[hv + k]);
-                                    let log_decay = lower_bound / (1.0 + (-gate).exp());
-                                    let si = sbase + k * hd + v;
-                                    st[si] *= log_decay.exp();
-                                    pred += st[si] * (qkv[kbase + k] * kinv);
-                                }
-                                let delta = (qkv[vbase + v] - pred) * b;
-                                let mut o = 0.0f32;
-                                for k in 0..hd {
-                                    let kval = qkv[kbase + k] * kinv;
-                                    let si = sbase + k * hd + v;
-                                    st[si] += kval * delta;
-                                    o += st[si] * (qkv[qbase + k] * qinv);
-                                }
-                                out[t * inner + hv + v] = o;
+                            for k in 0..hd {
+                                let gate = ah * (forget[fbase + k] + dt_bias[hv + k]);
+                                let log_decay = lower_bound / (1.0 + (-gate).exp());
+                                decay[k] = log_decay.exp();
+                                ksc[k] = qkv[kbase + k] * kinv;
+                                qsc[k] = qkv[qbase + k] * qinv;
                             }
+                            pred_v.fill(0.0);
+                            obuf.fill(0.0);
+                            for k in 0..hd {
+                                let d = decay[k];
+                                let kv = ksc[k];
+                                let srow = &mut st[sbase + k * hd..sbase + k * hd + hd];
+                                for v in 0..hd {
+                                    srow[v] *= d;
+                                    pred_v[v] += srow[v] * kv;
+                                }
+                            }
+                            for v in 0..hd {
+                                delta_v[v] = (qkv[vbase + v] - pred_v[v]) * b;
+                            }
+                            for k in 0..hd {
+                                let kv = ksc[k];
+                                let qv = qsc[k];
+                                let srow = &mut st[sbase + k * hd..sbase + k * hd + hd];
+                                for v in 0..hd {
+                                    srow[v] += kv * delta_v[v];
+                                    obuf[v] += srow[v] * qv;
+                                }
+                            }
+                            out[t * inner + hv..t * inner + hv + hd].copy_from_slice(&obuf);
                         }
                     }
                     vals[dst.0 as usize] = out;
