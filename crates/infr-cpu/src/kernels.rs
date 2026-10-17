@@ -8038,6 +8038,84 @@ mod kernel_tests {
     /// scale decode AND the integer dot — this is the primary correctness proof, no model available).
     /// vs the full-precision activation, the looser 3e-2 absorbs the lossy int8 activation quant,
     /// whose relative error the signed-grid dot's sign cancellation amplifies beyond IQ4_XS's 2e-2
+    /// Micro-bench at glm5next's real expert-bank shape (out_f=2048 rows × in_f=4096 × m tokens).
+    /// Answers the row-tiling question with numbers: `vec_dot_iq2xxs_batch` walks ALL m activations
+    /// for ONE weight row, so the activation matrix (m × in_f bytes) is re-streamed once per row —
+    /// 4.3 GB of traffic for m=512 where an 8-row tile would need a 512 MB sweep. Blocking the token
+    /// loop keeps the SAME per-element accumulation order (each `out[r]` is still one independent
+    /// row-sweep), so a faster blocked column below means the win is cache locality and the fix is
+    /// caller-side chunking, not a new SIMD kernel. Run:
+    /// `cargo test --release -p infr-cpu -- --ignored --nocapture bench_iq2xxs_expert_gemm`
+    #[test]
+    #[ignore]
+    fn bench_iq2xxs_expert_gemm() {
+        use std::time::Instant;
+        let in_f = 4096usize;
+        let nb = in_f / 256;
+        let out_f = 2048usize;
+        let rows: Vec<Vec<u8>> = (0..out_f)
+            .map(|o| build_iq2xxs_rand(nb, 0.05, 900 + o as u64))
+            .collect();
+        for &m in &[8usize, 64, 512] {
+            let q8s: Vec<Q8> = (0..m)
+                .map(|r| {
+                    let x: Vec<f32> = (0..in_f)
+                        .map(|i| (((r * 31 + i * 7) as f64 * 1e-4).sin() as f32) * 3.0)
+                        .collect();
+                    quantize_q8(&x)
+                })
+                .collect();
+            let mut out = vec![0f32; m];
+            let flops = 2.0 * (out_f * in_f * m) as f64;
+            // One pass over every row, all m tokens at once — what the seam does today.
+            for row in &rows {
+                vec_dot_iq2xxs_batch(row, &q8s, in_f, &mut out);
+            }
+            let reps = if m >= 512 { 1 } else { 4 };
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                for row in &rows {
+                    vec_dot_iq2xxs_batch(row, &q8s, in_f, &mut out);
+                }
+            }
+            let whole = t0.elapsed().as_secs_f64() / reps as f64;
+            let mut line = format!(
+                "[bench iq2xxs] m={m:4}  {:7.0} ms {:6.1} GF/s",
+                whole * 1e3,
+                flops / whole / 1e9
+            );
+            // Same work, token loop blocked so one token slab stays resident while all rows sweep.
+            // (Timing only: each slab writes its own scratch, so the index bookkeeping is honest
+            // without needing the real per-slab output offsets.)
+            for blk in [32usize, 64, 128] {
+                if blk >= m {
+                    continue;
+                }
+                let mut scratch = vec![0f32; blk];
+                for row in &rows {
+                    for c in q8s.chunks(blk) {
+                        vec_dot_iq2xxs_batch(row, c, in_f, &mut scratch[..c.len()]);
+                    }
+                }
+                let t1 = Instant::now();
+                for _ in 0..reps {
+                    for row in &rows {
+                        for c in q8s.chunks(blk) {
+                            vec_dot_iq2xxs_batch(row, c, in_f, &mut scratch[..c.len()]);
+                        }
+                    }
+                }
+                let dt = t1.elapsed().as_secs_f64() / reps as f64;
+                line.push_str(&format!(
+                    "  blk{blk:4} {:7.0} ms {:6.1} GF/s",
+                    dt * 1e3,
+                    flops / dt / 1e9,
+                ));
+            }
+            println!("{line}");
+        }
+    }
+
     /// (same bound IQ2_S uses). Covers single-row (m=1) and batch (m>1).
     #[test]
     fn iq2xxs_matches_dequant_reference() {
