@@ -186,6 +186,12 @@ prefill 与 decode 切换时可以重新分配弹性空间。
 专家缓存留多少显存才够、多张不同 PCIe 带宽的显卡该怎样分层？参见 [FlashNext 专家缓存与多卡配比](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)：包含真实访问序列的 0.5～48 GiB 离线回放曲线、连续分段指数函数，以及基于曲线的多卡层数分配公式和适用限制。
 
 
+## 相关项目
+
+- **[poorseek](https://github.com/dingyiyuan/poorseek)** —— DeepSeek-V4.1 在 Intel Arc Pro B70（32 GB）+ 192 GB
+  主机内存上的单卡 SYCL 推理框架：真实负载解码 19.5–23.2 tok/s（开 MTP/DSpark 投机解码 34–44 tok/s），
+  132 K 预填充 578 tok/s。
+
 ## 项目与署名
 
 MoE4All 由 John / [Headmaster218](https://github.com/Headmaster218) 维护。
